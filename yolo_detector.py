@@ -5,13 +5,37 @@ import cv2
 import numpy as np
 
 class YOLODetector:
-    def __init__(self, model_size='n'):
+    def __init__(self, model_size='m', models_dir="models"):
         """
         Initialize YOLO detector with specified model size
         model_size options: n (nano), s (small), m (medium), l (large), x (xlarge)
         """
-        # Load a pretrained YOLOv8 model
-        self.model = YOLO(f"yolov8{model_size}.pt")
+        # Ensure models directory exists
+        os.makedirs(models_dir, exist_ok=True)
+        
+        # Model path
+        model_name = f"yolov8{model_size}.pt"
+        model_path = os.path.join(models_dir, model_name)
+        
+        # Check if model exists in the models directory, if not, download to models directory
+        if not os.path.exists(model_path):
+            print(f"Model {model_name} not found in {models_dir}. Downloading and storing in models folder...")
+            # Using YOLO to download the model will automatically store it in the ultralytics cache,
+            # so we need to copy it to our models directory
+            temp_model = YOLO(model_name)
+            # Copy from cache to models directory
+            if hasattr(temp_model, 'ckpt_path') and os.path.exists(temp_model.ckpt_path):
+                import shutil
+                shutil.copy(temp_model.ckpt_path, model_path)
+                print(f"Model copied to {model_path}")
+            else:
+                # If we can't access the cache path, save the model directly
+                temp_model.save(model_path)
+                print(f"Model saved to {model_path}")
+                
+        # Load the model from models directory
+        self.model = YOLO(model_path)
+        print(f"Loaded YOLO model from {model_path}")
         
     def detect(self, image_path, conf_threshold=0.25):
         """
@@ -103,7 +127,7 @@ class YOLODetector:
 if __name__ == "__main__":
     # Initialize the YOLO detector with the 'n' (nano) model
     # You can change to 's', 'm', 'l', or 'x' for larger models with better accuracy but slower speed
-    detector = YOLODetector(model_size='n')
+    detector = YOLODetector(model_size='m')
     
     # Process all images in the input directory
     detector.process_directory(conf_threshold=0.3)

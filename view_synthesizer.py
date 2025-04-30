@@ -1,437 +1,365 @@
 import os
-import torch
 import numpy as np
 import cv2
-import kornia
 import matplotlib.pyplot as plt
 from pathlib import Path
-import time
+
 
 class ViewSynthesizer:
     """
-    Implements SynSin-inspired view synthesis to create multiple views of an object
-    using a single image and its depth map.
+    Handles multi-view synthesis for 3D reconstruction
     """
     
-    def __init__(self, device=None):
+    def __init__(self, output_dir="data/output/views", device=None):
         """
         Initialize the view synthesizer
         
         Args:
-            device: Torch device to use for computations
+            output_dir: Directory to save synthesized views
+            device: PyTorch device for processing
         """
-        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"View synthesizer using device: {self.device}")
-        
-    def preprocess_inputs(self, image, depth, mask=None):
-        """
-        Preprocess image and depth inputs for view synthesis
-        
-        Args:
-            image: RGB image as numpy array (H, W, 3)
-            depth: Depth map as numpy array (H, W)
-            mask: Optional mask as numpy array (H, W)
-            
-        Returns:
-            Preprocessed tensors ready for synthesis
-        """
-        # Convert to torch tensors
-        if isinstance(image, np.ndarray):
-            # Convert to float and normalize
-            image_np = image.astype(np.float32) / 255.0
-            # Convert to tensor [B, C, H, W]
-            image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        else:
-            image_tensor = image.to(self.device)
-            
-        if isinstance(depth, np.ndarray):
-            # Normalize depth if needed
-            if depth.max() > 1.0:
-                depth = depth.astype(np.float32) / 255.0
-            depth_tensor = torch.from_numpy(depth).unsqueeze(0).unsqueeze(0).to(self.device)
-        else:
-            depth_tensor = depth.to(self.device)
-            
-        # Process mask if provided
-        mask_tensor = None
-        if mask is not None:
-            if isinstance(mask, np.ndarray):
-                if mask.max() > 1.0:
-                    mask = mask.astype(np.float32) / 255.0
-                mask_tensor = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(self.device)
-            else:
-                mask_tensor = mask.to(self.device)
-            
-        return image_tensor, depth_tensor, mask_tensor
+        self.output_dir = output_dir
+        self.device = device
     
-    def generate_camera_transformations(self, num_views=8, rotation_range=45, elevation_range=30):
+    def generate_synthetic_views(self, image, depth_map, mask=None, num_views=8):
         """
-        Generate camera transformations for different views
+        Generate synthetic views around the object
         
         Args:
-            num_views: Number of views to generate
-            rotation_range: Maximum rotation angle in degrees
-            elevation_range: Maximum elevation angle in degrees
+            image: Input RGB image array
+            depth_map: Depth map of the input image
+            mask: Optional mask for the object
+            num_views: Number of synthetic views to generate
             
         Returns:
-            List of camera transformations
+            Dict with synthetic views and related data
         """
-        camera_transforms = []
+        print(f"Generating {num_views} synthetic views...")
         
-        # Generate views in a circle around the object
-        for i in range(num_views):
-            # Calculate rotation angle (around Y-axis)
-            angle_y = np.radians(rotation_range * np.sin(2 * np.pi * i / num_views))
-            
-            # Calculate elevation angle (around X-axis)
-            angle_x = np.radians(elevation_range * np.sin(2 * np.pi * i / num_views))
-            
-            # For a more interesting pattern, add some rotation around Z-axis too
-            angle_z = np.radians(rotation_range/2 * np.sin(np.pi * i / num_views))
-            
-            # Create rotation matrices
-            rot_x = torch.tensor([
-                [1, 0, 0],
-                [0, np.cos(angle_x), -np.sin(angle_x)],
-                [0, np.sin(angle_x), np.cos(angle_x)]
-            ], dtype=torch.float32, device=self.device)
-            
-            rot_y = torch.tensor([
-                [np.cos(angle_y), 0, np.sin(angle_y)],
-                [0, 1, 0],
-                [-np.sin(angle_y), 0, np.cos(angle_y)]
-            ], dtype=torch.float32, device=self.device)
-            
-            rot_z = torch.tensor([
-                [np.cos(angle_z), -np.sin(angle_z), 0],
-                [np.sin(angle_z), np.cos(angle_z), 0],
-                [0, 0, 1]
-            ], dtype=torch.float32, device=self.device)
-            
-            # Combine rotations (order matters: Y, X, Z)
-            rotation = rot_z @ rot_x @ rot_y
-            
-            # Translation: shift camera back a bit to keep object in view
-            translation = torch.tensor([0, 0, 0.2], dtype=torch.float32, device=self.device)
-            
-            # Create 4x4 transformation matrix
-            transform = torch.eye(4, dtype=torch.float32, device=self.device)
-            transform[:3, :3] = rotation
-            transform[:3, 3] = translation
-            
-            camera_transforms.append(transform)
-            
-        return camera_transforms
-    
-    def create_point_cloud(self, image, depth, mask=None, intrinsics=None):
-        """
-        Create a point cloud from an image and its depth map
+        # Create output directory if needed
+        os.makedirs(self.output_dir, exist_ok=True)
         
-        Args:
-            image: Image tensor [B, C, H, W]
-            depth: Depth tensor [B, 1, H, W]
-            mask: Optional mask tensor [B, 1, H, W]
-            intrinsics: Optional camera intrinsics matrix
-            
-        Returns:
-            points: 3D points [B, 3, N]
-            colors: Point colors [B, 3, N]
-        """
-        batch_size, _, height, width = image.shape
+        height, width = image.shape[:2]
         
-        # Create default camera intrinsics if not provided
-        # These are approximate values that work for most images
-        if intrinsics is None:
-            # Focal length is approximated as 1.2 * half the image width
-            focal_length = 1.2 * width / 2
-            # Principal point at the center of the image
-            cx, cy = width / 2, height / 2
-            
-            intrinsics = torch.tensor([
-                [focal_length, 0, cx],
-                [0, focal_length, cy],
-                [0, 0, 1]
-            ], dtype=torch.float32, device=self.device).unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        # Apply mask if provided
-        if mask is not None:
-            depth = depth * mask
-        
-        # Use kornia to create a 3D point cloud from the depth map
-        # Create meshgrid of pixel coordinates
-        xs = torch.linspace(0, width-1, width, device=self.device)
-        ys = torch.linspace(0, height-1, height, device=self.device)
-        y_grid, x_grid = torch.meshgrid(ys, xs, indexing='ij')
-        
-        # Stack coordinates and reshape
-        coords = torch.stack([x_grid, y_grid], dim=0).unsqueeze(0)  # [1, 2, H, W]
-        coords = coords.repeat(batch_size, 1, 1, 1)  # [B, 2, H, W]
-        
-        # Unproject 2D coordinates to 3D space
-        # Use kornia's depth_to_3d which handles the computation using camera intrinsics
-        points_3d = kornia.geometry.depth.depth_to_3d(depth, intrinsics)  # [B, 3, H, W]
-        
-        # Reshape points to [B, 3, H*W]
-        points = points_3d.reshape(batch_size, 3, -1)
-        
-        # Extract colors for each point
-        colors = image.reshape(batch_size, 3, -1)
-        
-        # If mask is provided, only keep points inside the mask
-        if mask is not None:
-            mask_flat = mask.reshape(batch_size, 1, -1)
-            mask_idx = (mask_flat > 0.5).repeat(1, 3, 1)
-            
-            # Extract valid points and colors
-            valid_points = []
-            valid_colors = []
-            
-            for b in range(batch_size):
-                valid_idx = mask_idx[b, 0]
-                valid_points.append(points[b, :, valid_idx])
-                valid_colors.append(colors[b, :, valid_idx])
-            
-            # Stack along batch dimension
-            points = torch.stack(valid_points, dim=0)
-            colors = torch.stack(valid_colors, dim=0)
-        
-        return points, colors
-    
-    def render_new_view(self, points, colors, transform, output_size):
-        """
-        Render a new view of the point cloud from a specific camera viewpoint
-        
-        Args:
-            points: 3D points [B, 3, N]
-            colors: Point colors [B, 3, N]
-            transform: Camera transformation matrix [4, 4]
-            output_size: Tuple of (height, width) for the output image
-            
-        Returns:
-            Rendered image and depth map
-        """
-        batch_size = points.shape[0]
-        height, width = output_size
-        
-        # Apply transformation to points
-        # Extract rotation and translation from transform
-        rotation = transform[:3, :3].unsqueeze(0)
-        translation = transform[:3, 3].unsqueeze(0).unsqueeze(-1)
-        
-        # Apply rotation and translation
-        transformed_points = torch.bmm(rotation.repeat(batch_size, 1, 1), points) + translation.repeat(batch_size, 1, 1)
-        
-        # Project 3D points to 2D image space
-        # Simple pinhole camera model
-        # Assuming a default focal length of 1.2 * half the image width
-        focal_length = 1.2 * width / 2
-        
-        # Principal point at the center of the image
+        # Calculate camera intrinsics
+        focal_length = max(height, width)
         cx, cy = width / 2, height / 2
         
-        # Project points: [x/z, y/z] * focal_length + [cx, cy]
-        z = transformed_points[:, 2:3]  # depths
-        x = transformed_points[:, 0:1] / (z + 1e-10) * focal_length + cx
-        y = transformed_points[:, 1:2] / (z + 1e-10) * focal_length + cy
+        intrinsics = np.array([
+            [focal_length, 0, cx],
+            [0, focal_length, cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
         
-        # Stack x, y coordinates
-        pixel_coords = torch.cat([x, y], dim=1)  # [B, 2, N]
+        # Generate camera poses around the object
+        angles = np.linspace(0, 2 * np.pi, num_views, endpoint=False)
+        radius = 2.0  # Distance from camera to object
         
-        # Initialize output image and depth map
-        rendered_image = torch.zeros(batch_size, 3, height, width, device=self.device)
-        rendered_depth = torch.ones(batch_size, 1, height, width, device=self.device) * float('inf')
+        views = []
+        depths = []
+        extrinsics = []
         
-        # Create a simple z-buffer renderer
-        for b in range(batch_size):
-            # Convert pixel coordinates to integers
-            coords = pixel_coords[b].t()  # [N, 2]
-            px = coords[:, 0].round().long()
-            py = coords[:, 1].round().long()
+        for i, angle in enumerate(angles):
+            # Calculate camera position based on angle
+            camera_pos = np.array([
+                radius * np.sin(angle),
+                0.5,  # Slight elevation
+                radius * np.cos(angle)
+            ])
             
-            # Filter out points outside the image
-            mask = (px >= 0) & (px < width) & (py >= 0) & (py < height)
-            px, py = px[mask], py[mask]
+            # Look-at matrix construction
+            z_axis = -camera_pos / np.linalg.norm(camera_pos)  # Forward
+            temp = np.array([0, 1, 0])  # Temporary up vector
+            x_axis = np.cross(temp, z_axis)
+            x_axis = x_axis / np.linalg.norm(x_axis)  # Right
+            y_axis = np.cross(z_axis, x_axis)  # Up
             
-            # Get z values (depths)
-            z_vals = z[b, 0, mask]
+            # Create rotation matrix
+            rotation = np.column_stack([x_axis, y_axis, z_axis])
             
-            # Get colors
-            point_colors = colors[b, :, mask]
+            # Create extrinsic matrix [R|t]
+            extrinsic = np.eye(4, dtype=np.float32)
+            extrinsic[:3, :3] = rotation
+            extrinsic[:3, 3] = camera_pos
             
-            # For each point, check if it's closer than what's already in the z-buffer
-            for i in range(len(px)):
-                x_i, y_i = px[i], py[i]
-                depth_val = z_vals[i]
-                
-                # Only update if this point is closer
-                if depth_val < rendered_depth[b, 0, y_i, x_i]:
-                    rendered_depth[b, 0, y_i, x_i] = depth_val
-                    rendered_image[b, :, y_i, x_i] = point_colors[:, i]
+            # Generate synthetic view using 3D warping
+            view, depth = self._generate_view_from_depth(
+                image, depth_map, intrinsics, np.linalg.inv(extrinsic), width, height)
+            
+            # Apply post-processing to improve quality
+            view = self._post_process_view(view)
+            
+            views.append(view)
+            depths.append(depth)
+            extrinsics.append(extrinsic)
+            
+            print(f"Created view {i+1}/{num_views}")
         
-        # Replace inf values in depth with 0
-        rendered_depth[rendered_depth == float('inf')] = 0
-        
-        # Normalize depth map to [0, 1]
-        depth_max = rendered_depth.max()
-        if depth_max > 0:
-            rendered_depth = rendered_depth / depth_max
-        
-        return rendered_image, rendered_depth
+        return {
+            "views": views,
+            "depths": depths,
+            "intrinsics": intrinsics,
+            "extrinsics": extrinsics
+        }
     
-    def generate_synthetic_views(self, image, depth, mask=None, num_views=8, output_size=None):
+    def _generate_view_from_depth(self, image, depth_map, intrinsics, extrinsic, width, height):
         """
-        Generate multiple synthetic views of an object from different angles
+        Generate a synthetic view from depth map using 3D warping
         
         Args:
-            image: RGB image as numpy array (H, W, 3)
-            depth: Depth map as numpy array (H, W)
-            mask: Optional mask as numpy array (H, W)
-            num_views: Number of views to generate
-            output_size: Optional tuple (height, width) for output size
+            image: Input RGB image
+            depth_map: Depth map of the input image
+            intrinsics: Camera intrinsics matrix
+            extrinsic: Target view extrinsic matrix
+            width: Target view width
+            height: Target view height
             
         Returns:
-            List of synthetic views (RGB images and depth maps)
+            Synthetic view RGB image and corresponding depth map
         """
-        # Preprocess inputs
-        image_tensor, depth_tensor, mask_tensor = self.preprocess_inputs(image, depth, mask)
+        # Create pixel grid
+        y, x = np.mgrid[0:height, 0:width]
+        pixels = np.stack([x.flatten(), y.flatten(), np.ones_like(x.flatten())], axis=0)
         
-        # Set output size if not provided
-        if output_size is None:
-            _, _, height, width = image_tensor.shape
-            output_size = (height, width)
+        # Reproject depth points to 3D
+        depth_values = depth_map.flatten()
         
-        # Create point cloud
-        points, colors = self.create_point_cloud(image_tensor, depth_tensor, mask_tensor)
+        # Skip zero depth pixels
+        valid_mask = depth_values > 0
+        valid_pixels = pixels[:, valid_mask]
+        valid_depths = depth_values[valid_mask]
         
-        # Generate camera transformations
-        camera_transforms = self.generate_camera_transformations(num_views)
+        # Unproject to 3D points in the first camera coordinate system
+        rays = np.linalg.inv(intrinsics) @ valid_pixels
+        points_3d = rays * valid_depths[np.newaxis, :]
         
-        # Render synthetic views
-        synthetic_views = []
+        # Convert to homogeneous coordinates
+        points_3d_homogeneous = np.vstack([points_3d, np.ones_like(valid_depths)])
         
-        for i, transform in enumerate(camera_transforms):
-            # Render new view
-            rendered_image, rendered_depth = self.render_new_view(points, colors, transform, output_size)
-            
-            # Convert to numpy for saving
-            rgb_image = rendered_image[0].permute(1, 2, 0).cpu().numpy()
-            depth_image = rendered_depth[0, 0].cpu().numpy()
-            
-            # Clip and convert to uint8 for RGB image
-            rgb_image = np.clip(rgb_image * 255, 0, 255).astype(np.uint8)
-            
-            # Add to results
-            synthetic_views.append({
-                'rgb': rgb_image,
-                'depth': depth_image,
-                'angle': i * (360 / num_views)
-            })
+        # Transform to world coordinates and then to new view
+        points_new_view = extrinsic @ points_3d_homogeneous
         
-        return synthetic_views
+        # Project to 2D in the new view
+        points_2d_homogeneous = intrinsics @ points_new_view[:3, :]
+        points_2d = points_2d_homogeneous[:2, :] / (points_2d_homogeneous[2, :] + 1e-10)
+        
+        # Round to nearest pixel and check bounds
+        points_2d_int = np.round(points_2d).astype(np.int32)
+        
+        # Create new view image and depth map
+        new_view = np.zeros((height, width, 3), dtype=np.uint8)
+        new_depth = np.zeros((height, width), dtype=np.float32)
+        
+        # Filter points within image bounds
+        mask = ((points_2d_int[0, :] >= 0) & 
+                (points_2d_int[0, :] < width) & 
+                (points_2d_int[1, :] >= 0) & 
+                (points_2d_int[1, :] < height))
+        
+        # Sort points by depth (nearest first for proper occlusion handling)
+        z_values = points_new_view[2, :]
+        sorted_indices = np.argsort(-z_values[mask])  # Descending order
+        
+        # Get pixel coordinates and corresponding values
+        x_coords = points_2d_int[0, mask][sorted_indices]
+        y_coords = points_2d_int[1, mask][sorted_indices]
+        rgb_values = image[np.unravel_index(np.where(valid_mask)[0][mask][sorted_indices], (height, width))]
+        depth_values = z_values[mask][sorted_indices]
+        
+        # Render view with z-buffer approach
+        for x_coord, y_coord, rgb_value, depth_value in zip(x_coords, y_coords, rgb_values, depth_values):
+            # Only update if closer than existing depth
+            if new_depth[y_coord, x_coord] == 0 or depth_value < new_depth[y_coord, x_coord]:
+                new_view[y_coord, x_coord] = rgb_value
+                new_depth[y_coord, x_coord] = depth_value
+        
+        return new_view, new_depth
     
-    def save_synthetic_views(self, views, output_dir, base_name):
+    def _post_process_view(self, view):
+        """
+        Apply post-processing to improve synthetic view quality
+        
+        Args:
+            view: Synthetic view RGB image
+            
+        Returns:
+            Post-processed RGB image
+        """
+        # Convert to grayscale for processing
+        gray = cv2.cvtColor(view, cv2.COLOR_RGB2GRAY)
+        
+        # Find holes (black regions)
+        _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+        mask = mask.astype(np.uint8)
+        
+        # Only proceed if there are holes to fill
+        if np.sum(mask == 0) > 0:
+            # Dilate the mask to expand valid regions
+            kernel = np.ones((3, 3), np.uint8)
+            dilated = cv2.dilate(mask, kernel, iterations=1)
+            
+            # Find new pixels to fill (dilated - original mask)
+            fill_mask = dilated & ~mask
+            
+            # For each channel, perform inpainting
+            result = view.copy()
+            
+            # Simple inpainting by averaging nearby valid pixels
+            for i in range(3):  # RGB channels
+                valid_regions = view[:, :, i] * (mask > 0)
+                
+                # Use simple blur to fill small holes
+                blurred = cv2.blur(valid_regions, (5, 5))
+                
+                # Only apply blurred values to holes
+                result[:, :, i] = np.where(fill_mask > 0, blurred, result[:, :, i])
+            
+            # Apply bilateral filter to smooth while preserving edges
+            result = cv2.bilateralFilter(result, 9, 75, 75)
+            
+            return result
+    
+    def _create_views_collage(self, views, img_name, view_dir):
+        """
+        Create a collage of all synthetic views
+        
+        Args:
+            views: List of synthetic view RGB images
+            img_name: Base name for output files
+            view_dir: Directory to save collage
+            
+        Returns:
+            Path to collage image
+        """
+        num_views = len(views)
+        
+        # Determine grid size
+        grid_size = int(np.ceil(np.sqrt(num_views)))
+        rows, cols = grid_size, grid_size
+        
+        # Get image dimensions
+        height, width = views[0].shape[:2]
+        
+        # Create collage
+        collage = np.zeros((rows * height, cols * width, 3), dtype=np.uint8)
+        
+        for i, view in enumerate(views):
+            if i >= rows * cols:
+                break
+                
+            row, col = i // cols, i % cols
+            y_start, y_end = row * height, (row + 1) * height
+            x_start, x_end = col * width, (col + 1) * width
+            
+            collage[y_start:y_end, x_start:x_end] = view
+        
+        # Save collage
+        collage_path = os.path.join(view_dir, f"{img_name}_views_collage.jpg")
+        cv2.imwrite(collage_path, cv2.cvtColor(collage, cv2.COLOR_RGB2BGR))
+        
+        return collage_path
+    
+    def _create_depth_collage(self, depths, img_name, view_dir):
+        """
+        Create a collage of all depth maps
+        
+        Args:
+            depths: List of depth maps
+            img_name: Base name for output files
+            view_dir: Directory to save collage
+            
+        Returns:
+            Paths to grayscale and colored depth collages
+        """
+        num_depths = len(depths)
+        
+        # Determine grid size
+        grid_size = int(np.ceil(np.sqrt(num_depths)))
+        rows, cols = grid_size, grid_size
+        
+        # Get image dimensions
+        height, width = depths[0].shape[:2]
+        
+        # Create collages (grayscale and colored)
+        collage = np.zeros((rows * height, cols * width), dtype=np.float32)
+        collage_colored = np.zeros((rows * height, cols * width, 3), dtype=np.uint8)
+        
+        for i, depth in enumerate(depths):
+            if i >= rows * cols:
+                break
+                
+            row, col = i // cols, i % cols
+            y_start, y_end = row * height, (row + 1) * height
+            x_start, x_end = col * width, (col + 1) * width
+            
+            # Normalize depth map
+            normalized_depth = depth / (np.max(depth) + 1e-10)
+            
+            # Add to grayscale collage
+            collage[y_start:y_end, x_start:x_end] = normalized_depth
+            
+            # Add to colored collage
+            colored_depth = plt.cm.plasma(normalized_depth)[:, :, :3]
+            colored_depth = (colored_depth * 255).astype(np.uint8)
+            collage_colored[y_start:y_end, x_start:x_end] = colored_depth
+        
+        # Save collages
+        collage_path = os.path.join(view_dir, f"{img_name}_depth_collage.jpg")
+        collage_colored_path = os.path.join(view_dir, f"{img_name}_depth_collage_colored.jpg")
+        
+        # Save grayscale depth collage
+        plt.imsave(collage_path, collage, cmap='gray')
+        
+        # Save colored depth collage
+        plt.imsave(collage_colored_path, collage_colored / 255.0)
+        
+        return collage_path, collage_colored_path
+    
+    def save_synthetic_views(self, synthetic_views_data, output_dir, img_name):
         """
         Save synthetic views to disk
         
         Args:
-            views: List of synthetic views (RGB images and depth maps)
+            synthetic_views_data: Dictionary with views, depths, etc.
             output_dir: Directory to save the views
-            base_name: Base name for the output files
+            img_name: Base name for output files
             
         Returns:
             Dictionary with paths to saved files
         """
         os.makedirs(output_dir, exist_ok=True)
         
-        output_paths = {'rgb': [], 'depth': []}
+        views = synthetic_views_data["views"]
+        depths = synthetic_views_data["depths"]
         
-        for i, view in enumerate(views):
-            # Save RGB image
-            rgb_path = os.path.join(output_dir, f"{base_name}_view_{i:02d}.jpg")
-            cv2.imwrite(rgb_path, cv2.cvtColor(view['rgb'], cv2.COLOR_RGB2BGR))
-            output_paths['rgb'].append(rgb_path)
+        # Save individual views and depths
+        view_paths = []
+        depth_paths = []
+        
+        for i, (view, depth) in enumerate(zip(views, depths)):
+            # Save synthetic view
+            view_path = os.path.join(output_dir, f"{img_name}_view_{i:02d}.jpg")
+            cv2.imwrite(view_path, cv2.cvtColor(view, cv2.COLOR_RGB2BGR))
+            view_paths.append(view_path)
             
-            # Save depth map
-            depth_path = os.path.join(output_dir, f"{base_name}_view_{i:02d}_depth.jpg")
-            cv2.imwrite(depth_path, (view['depth'] * 255).astype(np.uint8))
-            output_paths['depth'].append(depth_path)
-            
-        # Create a collage of all views
-        self._create_views_collage(views, output_dir, base_name)
+            # Save depth visualization
+            depth_path = os.path.join(output_dir, f"{img_name}_view_{i:02d}_depth.jpg")
+            plt.imsave(depth_path, depth, cmap='plasma')
+            depth_paths.append(depth_path)
         
-        return output_paths
-    
-    def _create_views_collage(self, views, output_dir, base_name):
-        """
-        Create a collage of all synthetic views
+        # Create views collage
+        collage_path = self._create_views_collage(views, img_name, output_dir)
         
-        Args:
-            views: List of synthetic views
-            output_dir: Directory to save the collage
-            base_name: Base name for the output file
-        """
-        num_views = len(views)
+        # Create depth collage
+        depth_collage_path, depth_collage_colored_path = self._create_depth_collage(depths, img_name, output_dir)
         
-        # Determine grid size (try to make it square-ish)
-        grid_size = int(np.ceil(np.sqrt(num_views)))
-        rows, cols = grid_size, grid_size
+        print(f"Saved {len(views)} synthetic views to {output_dir}")
         
-        # Get view dimensions
-        view_height, view_width = views[0]['rgb'].shape[:2]
-        
-        # Create empty canvas
-        canvas_rgb = np.zeros((rows * view_height, cols * view_width, 3), dtype=np.uint8)
-        canvas_depth = np.zeros((rows * view_height, cols * view_width), dtype=np.uint8)
-        
-        # Place views in grid
-        for i, view in enumerate(views):
-            if i >= rows * cols:
-                break
-                
-            row = i // cols
-            col = i % cols
-            
-            y_start = row * view_height
-            y_end = y_start + view_height
-            x_start = col * view_width
-            x_end = x_start + view_width
-            
-            # Add RGB image
-            canvas_rgb[y_start:y_end, x_start:x_end] = view['rgb']
-            
-            # Add depth map
-            canvas_depth[y_start:y_end, x_start:x_end] = (view['depth'] * 255).astype(np.uint8)
-        
-        # Save collages
-        rgb_collage_path = os.path.join(output_dir, f"{base_name}_views_collage.jpg")
-        cv2.imwrite(rgb_collage_path, cv2.cvtColor(canvas_rgb, cv2.COLOR_RGB2BGR))
-        
-        depth_collage_path = os.path.join(output_dir, f"{base_name}_depth_collage.jpg")
-        cv2.imwrite(depth_collage_path, canvas_depth)
-        
-        # Create colorized depth collage
-        depth_colored = np.zeros_like(canvas_rgb)
-        for i in range(rows * view_height):
-            for j in range(cols * view_width):
-                depth_val = canvas_depth[i, j] / 255.0
-                if depth_val > 0:
-                    # Apply jet colormap
-                    r, g, b = 0, 0, 0
-                    if depth_val < 0.25:
-                        b = 255
-                        g = int(255 * (depth_val / 0.25))
-                    elif depth_val < 0.5:
-                        b = int(255 * (1 - (depth_val - 0.25) / 0.25))
-                        g = 255
-                    elif depth_val < 0.75:
-                        g = 255
-                        r = int(255 * ((depth_val - 0.5) / 0.25))
-                    else:
-                        g = int(255 * (1 - (depth_val - 0.75) / 0.25))
-                        r = 255
-                    depth_colored[i, j] = [r, g, b]
-        
-        depth_color_path = os.path.join(output_dir, f"{base_name}_depth_collage_colored.jpg")
-        cv2.imwrite(depth_color_path, cv2.cvtColor(depth_colored, cv2.COLOR_RGB2BGR))
-        
-        print(f"Saved view collages to {rgb_collage_path} and {depth_collage_path}")
+        return {
+            "view_paths": view_paths,
+            "depth_paths": depth_paths,
+            "collage_path": collage_path,
+            "depth_collage_path": depth_collage_path,
+            "depth_collage_colored_path": depth_collage_colored_path,
+            "view_dir": output_dir
+        }

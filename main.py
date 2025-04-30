@@ -338,8 +338,8 @@ class Pipeline3D:
         voxel_grid = self.create_voxel_grid(original_depth, mask, resolution)
         
         # Integrate information from synthetic views
-        for i, depth_path in enumerate(synthetic_views['depth']):
-            print(f"Integrating synthetic view {i+1}/{len(synthetic_views['depth'])}...")
+        for i, depth_path in enumerate(synthetic_views['depth_paths']):
+            print(f"Integrating synthetic view {i+1}/{len(synthetic_views['depth_paths'])}...")
             
             # Load synthetic depth map
             synthetic_depth = self.load_depth_map(depth_path)
@@ -489,11 +489,8 @@ class Pipeline3D:
         if mask_path and os.path.exists(mask_path):
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
             
-        # Project texture onto mesh using mesh vertices positions
-        # This is an improved approach for better texture mapping
-        
+        # Project texture onto mesh using improved UV mapping approach
         # First, establish the mapping from 3D to 2D
-        # Normalize mesh vertices to [0, 1] range on XY plane
         vertices = mesh.vertices.copy()
         min_vals = np.min(vertices, axis=0)
         max_vals = np.max(vertices, axis=0)
@@ -508,23 +505,30 @@ class Pipeline3D:
         # Get image dimensions
         img_height, img_width = image_rgb.shape[:2]
         
-        # Improved mapping: use all dimensions to create better mapping
-        # This helps when the object has complex 3D structure
-        img_coords_x = (normalized_vertices[:, 0] * img_width * 0.8 + img_width * 0.1).astype(np.int32)
-        img_coords_y = (normalized_vertices[:, 1] * img_height * 0.8 + img_height * 0.1).astype(np.int32)
+        # Improved mapping: Use spherical coordinates for better texture wrapping
+        # This works better for most object types
         
-        # Add some variation based on Z to create better texture wrapping
-        z_offset_x = (normalized_vertices[:, 2] * 0.1 * img_width).astype(np.int32)
-        z_offset_y = (normalized_vertices[:, 2] * 0.1 * img_height).astype(np.int32)
+        # Center the vertices around origin for proper spherical mapping
+        centered_verts = vertices - np.mean(vertices, axis=0)
         
-        img_coords_x = (img_coords_x + z_offset_x) % img_width
-        img_coords_y = (img_coords_y + z_offset_y) % img_height
+        # Calculate radius, azimuth and elevation for spherical coordinates
+        radius = np.sqrt(np.sum(centered_verts**2, axis=1))
+        azimuth = np.arctan2(centered_verts[:, 0], centered_verts[:, 2])  # Using X and Z
+        elevation = np.arcsin(centered_verts[:, 1] / (radius + 1e-10))  # Using Y
+        
+        # Normalize to [0, 1] range for texture mapping
+        u = (azimuth / (2 * np.pi) + 0.5) % 1.0  # Azimuth to U coordinate
+        v = (elevation / np.pi + 0.5)  # Elevation to V coordinate
+        
+        # Convert UV coordinates to image pixel coordinates
+        img_coords_x = (u * img_width).astype(np.int32)
+        img_coords_y = (v * img_height).astype(np.int32)
         
         # Clamp to image boundaries
         img_coords_x = np.clip(img_coords_x, 0, img_width - 1)
         img_coords_y = np.clip(img_coords_y, 0, img_height - 1)
         
-        # Sample colors from image with improved color vibrancy
+        # Sample colors from image with enhanced color vibrancy
         vertex_colors = np.zeros((len(vertices), 4), dtype=np.uint8)
         
         for i in range(len(vertices)):
@@ -537,7 +541,8 @@ class Pipeline3D:
                 
                 # Enhance color vibrancy (increase saturation)
                 hsv = cv2.cvtColor(np.array([[color]]), cv2.COLOR_RGB2HSV)[0, 0]
-                hsv[1] = min(hsv[1] * 1.2, 255)  # Increase saturation by 20%
+                hsv[1] = min(hsv[1] * 1.3, 255)  # Increase saturation by 30%
+                hsv[2] = min(hsv[2] * 1.1, 255)  # Increase value by 10%
                 enhanced_color = cv2.cvtColor(np.array([[hsv]]), cv2.COLOR_HSV2RGB)[0, 0]
                 
                 vertex_colors[i, :3] = enhanced_color
@@ -555,7 +560,7 @@ class Pipeline3D:
             vertex_colors=vertex_colors
         )
         
-        print("Texture mapping completed with enhanced color vibrancy.")
+        print("Texture mapping completed with enhanced spherical UV mapping and color vibrancy.")
         
         return textured_mesh
     
