@@ -122,7 +122,6 @@ The system calculates an overall accuracy score along with detailed metrics:
 
 ### Visualization Tools
 
-![Accuracy Radar Chart](data/output/evaluation/R_textured_accuracy_radar.png)
 
 The system automatically generates visualizations to help assess quality:
 
