@@ -1,0 +1,55 @@
+# Exclude all input and output image/model files
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.obj
+*.ply
+*.mtl
+*.npy
+
+# Exclude specific model files
+yolov8n.pt
+sam_vit_b_01ec64.pth
+
+# Exclude output directories content but keep the directory structure
+data/input/*
+data/output/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+.env
+.venv
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
