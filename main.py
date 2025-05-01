@@ -12,8 +12,240 @@ from PIL import Image
 import trimesh
 from skimage import measure
 from scipy import ndimage
+from sklearn.metrics import mean_squared_error
+from scipy.spatial.distance import directed_hausdorff
+from scipy.spatial import cKDTree
 from ultralytics import YOLO
 from view_synthesizer import ViewSynthesizer
+
+class EvaluationMetrics:
+    """
+    Class for evaluating 3D reconstruction quality
+    """
+    @staticmethod
+    def chamfer_distance(points_a, points_b):
+        """
+        Compute Chamfer Distance between two point clouds
+        
+        Args:
+            points_a: First point cloud (N x 3)
+            points_b: Second point cloud (M x 3)
+            
+        Returns:
+            Chamfer distance (bidirectional mean of closest point distances)
+        """
+        # Find nearest neighbors from A to B
+        tree_b = cKDTree(points_b)
+        dist_a_to_b, _ = tree_b.query(points_a)
+        
+        # Find nearest neighbors from B to A
+        tree_a = cKDTree(points_a)
+        dist_b_to_a, _ = tree_a.query(points_b)
+        
+        # Calculate bidirectional Chamfer distance
+        chamfer_dist = np.mean(dist_a_to_b) + np.mean(dist_b_to_a)
+        
+        return chamfer_dist
+    
+    @staticmethod
+    def hausdorff_distance(points_a, points_b):
+        """
+        Compute Hausdorff Distance between two point clouds
+        
+        Args:
+            points_a: First point cloud (N x 3)
+            points_b: Second point cloud (M x 3)
+            
+        Returns:
+            Hausdorff distance
+        """
+        # Compute directed Hausdorff distances
+        forward_hausdorff = directed_hausdorff(points_a, points_b)[0]
+        backward_hausdorff = directed_hausdorff(points_b, points_a)[0]
+        
+        # Take maximum of the two directed distances
+        hausdorff_dist = max(forward_hausdorff, backward_hausdorff)
+        
+        return hausdorff_dist
+    
+    @staticmethod
+    def normal_consistency(mesh_a, mesh_b, samples=10000):
+        """
+        Compute normal consistency between two meshes
+        
+        Args:
+            mesh_a: First mesh (trimesh.Trimesh)
+            mesh_b: Second mesh (trimesh.Trimesh)
+            samples: Number of sample points
+            
+        Returns:
+            Normal consistency score (1 is perfect, 0 is worst)
+        """
+        # Sample points and normals from both meshes
+        points_a, face_idx_a = mesh_a.sample(samples, return_index=True)
+        normals_a = mesh_a.face_normals[face_idx_a]
+        
+        points_b, face_idx_b = mesh_b.sample(samples, return_index=True)
+        normals_b = mesh_b.face_normals[face_idx_b]
+        
+        # Find nearest points in mesh B for each point in mesh A
+        tree_b = cKDTree(points_b)
+        _, idx_b = tree_b.query(points_a)
+        
+        # Get corresponding normals
+        corresponding_normals_b = normals_b[idx_b]
+        
+        # Compute dot product of normalized normals
+        normals_a_normalized = normals_a / np.linalg.norm(normals_a, axis=1, keepdims=True)
+        normals_b_normalized = corresponding_normals_b / np.linalg.norm(corresponding_normals_b, axis=1, keepdims=True)
+        
+        # Compute absolute dot product (normal consistency)
+        dot_products = np.abs(np.sum(normals_a_normalized * normals_b_normalized, axis=1))
+        normal_consistency = np.mean(dot_products)
+        
+        return normal_consistency
+    
+    @staticmethod
+    def f_score(points_a, points_b, threshold=0.01):
+        """
+        Compute F-score between two point clouds
+        
+        Args:
+            points_a: First point cloud (N x 3)
+            points_b: Second point cloud (M x 3)
+            threshold: Distance threshold for counting matches
+            
+        Returns:
+            F-score (harmonic mean of precision and recall)
+        """
+        # Find nearest neighbors from A to B
+        tree_b = cKDTree(points_b)
+        dist_a_to_b, _ = tree_b.query(points_a)
+        
+        # Find nearest neighbors from B to A
+        tree_a = cKDTree(points_a)
+        dist_b_to_a, _ = tree_a.query(points_b)
+        
+        # Calculate precision and recall
+        precision = np.mean(dist_a_to_b < threshold)
+        recall = np.mean(dist_b_to_a < threshold)
+        
+        # Calculate F-score
+        if precision + recall > 0:
+            f_score = 2 * precision * recall / (precision + recall)
+        else:
+            f_score = 0.0
+            
+        return f_score, precision, recall
+    
+    @staticmethod
+    def iou_voxel(voxel_grid_a, voxel_grid_b, threshold=0.5):
+        """
+        Compute IoU between two voxel grids
+        
+        Args:
+            voxel_grid_a: First voxel grid (binary)
+            voxel_grid_b: Second voxel grid (binary)
+            threshold: Threshold for binary conversion
+            
+        Returns:
+            IoU score
+        """
+        # Convert to binary if not already
+        binary_a = voxel_grid_a > threshold
+        binary_b = voxel_grid_b > threshold
+        
+        # Calculate intersection and union
+        intersection = np.logical_and(binary_a, binary_b).sum()
+        union = np.logical_or(binary_a, binary_b).sum()
+        
+        # Calculate IoU
+        if union > 0:
+            iou = intersection / union
+        else:
+            iou = 0.0
+            
+        return iou
+    
+    @staticmethod
+    def depth_accuracy(predicted_depth, ground_truth_depth, mask=None):
+        """
+        Compute depth map accuracy metrics
+        
+        Args:
+            predicted_depth: Predicted depth map
+            ground_truth_depth: Ground truth depth map
+            mask: Optional mask for evaluation on specific regions
+            
+        Returns:
+            Dictionary with depth accuracy metrics
+        """
+        if mask is not None:
+            valid_mask = mask > 0
+            pred = predicted_depth[valid_mask]
+            gt = ground_truth_depth[valid_mask]
+        else:
+            pred = predicted_depth.flatten()
+            gt = ground_truth_depth.flatten()
+            
+        # Calculate error metrics
+        abs_rel = np.mean(np.abs(pred - gt) / gt)
+        sq_rel = np.mean(((pred - gt) ** 2) / gt)
+        rmse = np.sqrt(mean_squared_error(gt, pred))
+        
+        return {
+            "abs_rel": abs_rel,
+            "sq_rel": sq_rel,
+            "rmse": rmse
+        }
+    
+    @staticmethod
+    def mesh_self_consistency(mesh):
+        """
+        Evaluate mesh quality metrics without ground truth
+        
+        Args:
+            mesh: Trimesh object
+            
+        Returns:
+            Dictionary with mesh quality metrics
+        """
+        # Check for watertightness
+        watertight = mesh.is_watertight
+        
+        # Calculate manifold edges ratio
+        if mesh.edges_unique.shape[0] > 0:
+            manifold_edges = np.mean(mesh.edges_unique_length > 0)
+        else:
+            manifold_edges = 0.0
+        
+        # Calculate mesh surface area and volume
+        surface_area = mesh.area
+        volume = 0
+        if watertight:
+            volume = mesh.volume
+            
+        # Count mesh components
+        connected_components = len(mesh.split())
+        
+        # Edge length statistics
+        if len(mesh.edges_unique_length) > 0:
+            edge_lengths = mesh.edges_unique_length
+            mean_edge_length = np.mean(edge_lengths)
+            std_edge_length = np.std(edge_lengths)
+        else:
+            mean_edge_length = 0
+            std_edge_length = 0
+        
+        return {
+            "watertight": watertight,
+            "manifold_edges_ratio": manifold_edges,
+            "surface_area": surface_area,
+            "volume": volume,
+            "connected_components": connected_components,
+            "mean_edge_length": mean_edge_length,
+            "std_edge_length": std_edge_length
+        }
 
 class Pipeline3D:
     def __init__(self, input_dir="data/input", output_dir="data/output"):
@@ -30,9 +262,10 @@ class Pipeline3D:
         self.voxels_dir = os.path.join(output_dir, "voxels")
         self.meshes_dir = os.path.join(output_dir, "meshes")
         self.views_dir = os.path.join(output_dir, "views")  # New directory for synthetic views
+        self.eval_dir = os.path.join(output_dir, "evaluation")  # New directory for evaluation results
         
         # Create output directories
-        for directory in [output_dir, self.depth_dir, self.voxels_dir, self.meshes_dir, self.views_dir]:
+        for directory in [output_dir, self.depth_dir, self.voxels_dir, self.meshes_dir, self.views_dir, self.eval_dir]:
             os.makedirs(directory, exist_ok=True)
             
         # Initialize device for PyTorch
@@ -852,6 +1085,349 @@ class Pipeline3D:
                 print(f"Saved mesh preview using matplotlib: {output_path}")
             except Exception as e2:
                 print(f"Failed to create mesh preview: {e2}")
+    
+    def evaluate_reconstruction(self, mesh_path, ground_truth_path=None):
+        """
+        Evaluate 3D reconstruction quality
+        
+        Args:
+            mesh_path: Path to the reconstructed mesh
+            ground_truth_path: Optional path to ground truth mesh for comparison
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        print(f"\n--- Evaluating Reconstruction Quality ---")
+        
+        # Load reconstructed mesh
+        if isinstance(mesh_path, trimesh.Trimesh):
+            reconstructed_mesh = mesh_path
+        else:
+            print(f"Loading reconstructed mesh from {mesh_path}")
+            reconstructed_mesh = trimesh.load(mesh_path)
+        
+        # Initialize metrics dictionary
+        metrics = {}
+        
+        # Basic mesh quality metrics (self-evaluation)
+        print("Computing mesh quality metrics...")
+        mesh_metrics = EvaluationMetrics.mesh_self_consistency(reconstructed_mesh)
+        metrics["mesh_quality"] = mesh_metrics
+        
+        # Create report with basic metrics
+        report = f"""
+        === RECONSTRUCTION QUALITY METRICS ===
+        
+        MESH INTEGRITY:
+        - Watertight: {mesh_metrics['watertight']}
+        - Connected Components: {mesh_metrics['connected_components']}
+        - Surface Area: {mesh_metrics['surface_area']:.2f}
+        - Volume: {mesh_metrics['volume']:.2f} (if watertight)
+        
+        MESH TOPOLOGY:
+        - Manifold Edges Ratio: {mesh_metrics['manifold_edges_ratio']:.4f}
+        - Mean Edge Length: {mesh_metrics['mean_edge_length']:.4f}
+        - Edge Length Std Dev: {mesh_metrics['std_edge_length']:.4f}
+        """
+        
+        # If ground truth is available, compute accuracy metrics
+        if ground_truth_path is not None:
+            print(f"Loading ground truth mesh from {ground_truth_path}")
+            try:
+                ground_truth_mesh = trimesh.load(ground_truth_path)
+                
+                # Sample points from both meshes for comparison
+                print("Sampling points from meshes for comparison...")
+                recon_points = reconstructed_mesh.sample(10000)
+                gt_points = ground_truth_mesh.sample(10000)
+                
+                # Compute geometric metrics
+                print("Computing Chamfer distance...")
+                chamfer_dist = EvaluationMetrics.chamfer_distance(recon_points, gt_points)
+                metrics["chamfer_distance"] = chamfer_dist
+                
+                print("Computing Hausdorff distance...")
+                hausdorff_dist = EvaluationMetrics.hausdorff_distance(recon_points, gt_points)
+                metrics["hausdorff_distance"] = hausdorff_dist
+                
+                print("Computing F-score...")
+                f_score, precision, recall = EvaluationMetrics.f_score(recon_points, gt_points, threshold=0.01)
+                metrics["f_score"] = f_score
+                metrics["precision"] = precision
+                metrics["recall"] = recall
+                
+                print("Computing normal consistency...")
+                normal_cons = EvaluationMetrics.normal_consistency(reconstructed_mesh, ground_truth_mesh)
+                metrics["normal_consistency"] = normal_cons
+                
+                # Add comparison metrics to report
+                report += f"""
+                COMPARISON TO GROUND TRUTH:
+                - Chamfer Distance: {chamfer_dist:.6f} (lower is better)
+                - Hausdorff Distance: {hausdorff_dist:.6f} (lower is better)
+                - F-score (1cm): {f_score:.4f} (higher is better)
+                - Precision: {precision:.4f}
+                - Recall: {recall:.4f}
+                - Normal Consistency: {normal_cons:.4f} (higher is better)
+                """
+            except Exception as e:
+                print(f"Error comparing to ground truth: {e}")
+                report += "\nCould not compare to ground truth due to an error."
+        
+        # Save report
+        img_name = Path(mesh_path).stem if isinstance(mesh_path, str) else "reconstruction"
+        report_path = os.path.join(self.eval_dir, f"{img_name}_evaluation.txt")
+        with open(report_path, "w") as f:
+            f.write(report)
+        
+        # Create a visual representation of metrics
+        self._create_metrics_visualization(metrics, img_name)
+        
+        print(f"Evaluation complete. Report saved to {report_path}")
+        return metrics
+    
+    def _create_metrics_visualization(self, metrics, img_name):
+        """
+        Create visual representation of evaluation metrics
+        
+        Args:
+            metrics: Dictionary with evaluation metrics
+            img_name: Base name for the output file
+        """
+        # Create figure for mesh quality metrics
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Extract mesh quality metrics
+        mesh_metrics = metrics.get("mesh_quality", {})
+        
+        # Create bar chart for key metrics
+        metric_names = ["Manifold Edges", "Connected Components"]
+        metric_values = [
+            mesh_metrics.get("manifold_edges_ratio", 0),
+            1.0 / max(1, mesh_metrics.get("connected_components", 1))  # Normalize: 1 component = 1.0, more = lower
+        ]
+        
+        # Add accuracy metrics if available
+        if "f_score" in metrics:
+            metric_names.extend(["F-score", "Precision", "Recall", "Normal Consistency"])
+            metric_values.extend([
+                metrics.get("f_score", 0),
+                metrics.get("precision", 0),
+                metrics.get("recall", 0),
+                metrics.get("normal_consistency", 0)
+            ])
+        
+        # Create bar chart
+        bars = ax.bar(metric_names, metric_values, color='skyblue')
+        
+        # Add value labels on top of bars
+        for bar in bars:
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                   f'{height:.2f}', ha='center', va='bottom')
+        
+        # Add titles and labels
+        ax.set_title('Reconstruction Quality Metrics')
+        ax.set_ylim(0, 1.1)  # Metrics are normalized to [0,1]
+        ax.set_ylabel('Score (higher is better)')
+        
+        # Add grid for better readability
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Rotate x-labels for better fit
+        plt.xticks(rotation=45, ha='right')
+        
+        # Save visualization
+        plt.tight_layout()
+        viz_path = os.path.join(self.eval_dir, f"{img_name}_metrics.png")
+        plt.savefig(viz_path)
+        plt.close()
+        
+        print(f"Metrics visualization saved to {viz_path}")
+    
+    def evaluate_depth_estimation(self, predicted_depth_path, ground_truth_depth_path=None, mask_path=None):
+        """
+        Evaluate depth estimation quality
+        
+        Args:
+            predicted_depth_path: Path to the predicted depth map
+            ground_truth_depth_path: Optional path to ground truth depth map
+            mask_path: Optional path to mask for evaluation
+            
+        Returns:
+            Dictionary with depth evaluation metrics
+        """
+        # Load predicted depth map
+        predicted_depth = cv2.imread(predicted_depth_path, cv2.IMREAD_GRAYSCALE)
+        if predicted_depth is None:
+            print(f"Error: Could not load predicted depth map from {predicted_depth_path}")
+            return None
+            
+        # Normalize to [0,1] if needed
+        if predicted_depth.max() > 1.0:
+            predicted_depth = predicted_depth.astype(np.float32) / 255.0
+        
+        # Load mask if provided
+        mask = None
+        if mask_path and os.path.exists(mask_path):
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None and mask.max() > 1.0:
+                mask = mask.astype(np.float32) / 255.0
+        
+        # If ground truth is available, compute accuracy metrics
+        if ground_truth_depth_path and os.path.exists(ground_truth_depth_path):
+            ground_truth_depth = cv2.imread(ground_truth_depth_path, cv2.IMREAD_GRAYSCALE)
+            if ground_truth_depth is None:
+                print(f"Error: Could not load ground truth depth from {ground_truth_depth_path}")
+            else:
+                # Normalize to [0,1] if needed
+                if ground_truth_depth.max() > 1.0:
+                    ground_truth_depth = ground_truth_depth.astype(np.float32) / 255.0
+                
+                # Compute depth accuracy metrics
+                metrics = EvaluationMetrics.depth_accuracy(predicted_depth, ground_truth_depth, mask)
+                
+                # Create visualizations for the comparison
+                self._visualize_depth_comparison(
+                    predicted_depth, 
+                    ground_truth_depth, 
+                    Path(predicted_depth_path).stem,
+                    mask
+                )
+                
+                return metrics
+        
+        # If no ground truth, return self-evaluation metrics
+        # For depth maps without ground truth, we can analyze smoothness, 
+        # edge preservation, and distribution statistics
+        
+        # Compute gradient magnitude for smoothness assessment
+        sobelx = cv2.Sobel(predicted_depth, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(predicted_depth, cv2.CV_32F, 0, 1, ksize=3)
+        gradient_magnitude = np.sqrt(sobelx**2 + sobely**2)
+        
+        # Compute metrics
+        metrics = {
+            "mean_depth": float(np.mean(predicted_depth[predicted_depth > 0])),
+            "std_depth": float(np.std(predicted_depth[predicted_depth > 0])),
+            "median_depth": float(np.median(predicted_depth[predicted_depth > 0])),
+            "gradient_mean": float(np.mean(gradient_magnitude)),
+            "zero_depth_ratio": float(np.mean(predicted_depth == 0))
+        }
+        
+        # Visualize depth map and analysis
+        self._visualize_depth_analysis(predicted_depth, Path(predicted_depth_path).stem, mask)
+        
+        return metrics
+    
+    def _visualize_depth_comparison(self, predicted_depth, ground_truth_depth, img_name, mask=None):
+        """
+        Create visual comparison between predicted and ground truth depth maps
+        
+        Args:
+            predicted_depth: Predicted depth map
+            ground_truth_depth: Ground truth depth map
+            img_name: Base name for the output file
+            mask: Optional mask for focused evaluation
+        """
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        
+        # Show predicted depth
+        axes[0].imshow(predicted_depth, cmap='magma')
+        axes[0].set_title('Predicted Depth')
+        axes[0].axis('off')
+        
+        # Show ground truth depth
+        axes[1].imshow(ground_truth_depth, cmap='magma')
+        axes[1].set_title('Ground Truth Depth')
+        axes[1].axis('off')
+        
+        # Show absolute error
+        error = np.abs(predicted_depth - ground_truth_depth)
+        if mask is not None:
+            error = error * (mask > 0)
+            
+        im = axes[2].imshow(error, cmap='hot')
+        axes[2].set_title('Absolute Error')
+        axes[2].axis('off')
+        
+        # Add colorbar for error
+        fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+        
+        # Save figure
+        plt.tight_layout()
+        viz_path = os.path.join(self.eval_dir, f"{img_name}_depth_comparison.png")
+        plt.savefig(viz_path)
+        plt.close()
+        
+        print(f"Depth comparison visualization saved to {viz_path}")
+    
+    def _visualize_depth_analysis(self, depth_map, img_name, mask=None):
+        """
+        Create visual analysis of a depth map
+        
+        Args:
+            depth_map: Depth map to analyze
+            img_name: Base name for the output file
+            mask: Optional mask for focused evaluation
+        """
+        # Apply mask if provided
+        analysis_depth = depth_map.copy()
+        if mask is not None:
+            analysis_depth = analysis_depth * (mask > 0)
+            nonzero_mask = (mask > 0)
+        else:
+            nonzero_mask = (analysis_depth > 0)
+        
+        # Create figure with multiple plots
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        
+        # Plot depth map
+        axes[0, 0].imshow(analysis_depth, cmap='magma')
+        axes[0, 0].set_title('Depth Map')
+        axes[0, 0].axis('off')
+        
+        # Plot gradient magnitude
+        sobelx = cv2.Sobel(analysis_depth, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(analysis_depth, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.sqrt(sobelx**2 + sobely**2)
+        axes[0, 1].imshow(gradient, cmap='viridis')
+        axes[0, 1].set_title('Gradient Magnitude')
+        axes[0, 1].axis('off')
+        
+        # Plot depth histogram
+        valid_depths = analysis_depth[nonzero_mask]
+        if len(valid_depths) > 0:
+            axes[1, 0].hist(valid_depths.flatten(), bins=50, color='skyblue')
+            axes[1, 0].set_title('Depth Distribution')
+            axes[1, 0].set_xlabel('Normalized Depth')
+            axes[1, 0].set_ylabel('Frequency')
+            
+            # Calculate and display statistics
+            mean_depth = np.mean(valid_depths)
+            median_depth = np.median(valid_depths)
+            std_depth = np.std(valid_depths)
+            stats_text = f"Mean: {mean_depth:.4f}\nMedian: {median_depth:.4f}\nStd Dev: {std_depth:.4f}"
+            axes[1, 0].text(0.95, 0.95, stats_text, transform=axes[1, 0].transAxes, 
+                           verticalalignment='top', horizontalalignment='right',
+                           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # Plot depth cross-section (middle row)
+        mid_row = depth_map.shape[0] // 2
+        x = np.arange(depth_map.shape[1])
+        axes[1, 1].plot(x, depth_map[mid_row, :], color='blue')
+        axes[1, 1].set_title(f'Depth Cross-Section (Row {mid_row})')
+        axes[1, 1].set_xlabel('Column')
+        axes[1, 1].set_ylabel('Depth')
+        axes[1, 1].grid(True, linestyle='--', alpha=0.7)
+        
+        # Save figure
+        plt.tight_layout()
+        viz_path = os.path.join(self.eval_dir, f"{img_name}_depth_analysis.png")
+        plt.savefig(viz_path)
+        plt.close()
+        
+        print(f"Depth analysis visualization saved to {viz_path}")
 
 
 def main():
@@ -876,10 +1452,42 @@ def main():
     parser.add_argument("--num-views", type=int, default=8,
                        help="Number of synthetic views to generate")
     
+    # New evaluation arguments
+    parser.add_argument("--evaluate", action="store_true",
+                       help="Enable evaluation of reconstruction quality")
+    parser.add_argument("--ground-truth", default=None,
+                       help="Path to ground truth mesh for evaluation (optional)")
+    parser.add_argument("--evaluate-mesh", default=None,
+                       help="Path to an existing mesh to evaluate (skip reconstruction)")
+    parser.add_argument("--evaluate-depth", default=None,
+                       help="Path to a depth map to evaluate")
+    parser.add_argument("--gt-depth", default=None,
+                       help="Path to ground truth depth map for comparison (optional)")
+    
     args = parser.parse_args()
     
     # Initialize the pipeline
     pipeline = Pipeline3D(input_dir=args.input, output_dir=args.output)
+    
+    # Handle evaluation-only mode
+    if args.evaluate_mesh:
+        if os.path.exists(args.evaluate_mesh):
+            print(f"\n=== Evaluating Existing Mesh: {args.evaluate_mesh} ===")
+            pipeline.evaluate_reconstruction(args.evaluate_mesh, args.ground_truth)
+            return
+        else:
+            print(f"Error: Mesh file {args.evaluate_mesh} not found")
+            return
+            
+    # Handle depth evaluation-only mode
+    if args.evaluate_depth:
+        if os.path.exists(args.evaluate_depth):
+            print(f"\n=== Evaluating Depth Map: {args.evaluate_depth} ===")
+            pipeline.evaluate_depth_estimation(args.evaluate_depth, args.gt_depth)
+            return
+        else:
+            print(f"Error: Depth map {args.evaluate_depth} not found")
+            return
     
     # Process images
     if args.single_image:
@@ -887,7 +1495,7 @@ def main():
             print(f"Error: Image {args.single_image} not found")
             return
         
-        pipeline.process_image(
+        results = pipeline.process_image(
             args.single_image,
             segmentation=args.segmentation,
             depth_model=args.depth_model,
@@ -896,8 +1504,22 @@ def main():
             generate_views=not args.no_views,
             num_views=args.num_views
         )
+        
+        # Evaluate if requested
+        if args.evaluate:
+            if 'mesh' in results and 'obj' in results['mesh']:
+                mesh_path = results['mesh']['obj']
+                print(f"\n=== Evaluating Reconstruction Quality for {args.single_image} ===")
+                pipeline.evaluate_reconstruction(mesh_path, args.ground_truth)
+                
+                # Also evaluate depth map quality
+                if 'depth' in results and 'depth' in results['depth']:
+                    depth_path = results['depth']['depth']
+                    print(f"\n=== Evaluating Depth Estimation Quality for {args.single_image} ===")
+                    pipeline.evaluate_depth_estimation(depth_path, args.gt_depth, 
+                                                     results['segmentation'].get('masks'))
     else:
-        pipeline.process_all_images(
+        results = pipeline.process_all_images(
             segmentation=args.segmentation,
             depth_model=args.depth_model,
             voxel_resolution=args.resolution,
@@ -905,6 +1527,21 @@ def main():
             generate_views=not args.no_views,
             num_views=args.num_views
         )
+        
+        # Evaluate all results if requested
+        if args.evaluate and results:
+            print("\n=== Evaluating All Reconstructions ===")
+            for img_path, result in results.items():
+                if 'mesh' in result and 'obj' in result['mesh']:
+                    mesh_path = result['mesh']['obj']
+                    print(f"\n--- Evaluating {Path(img_path).stem} ---")
+                    pipeline.evaluate_reconstruction(mesh_path, args.ground_truth)
+                    
+                    # Also evaluate depth map quality
+                    if 'depth' in result and 'depth' in result['depth']:
+                        depth_path = result['depth']['depth']
+                        pipeline.evaluate_depth_estimation(depth_path, args.gt_depth,
+                                                         result['segmentation'].get('masks'))
 
 
 if __name__ == "__main__":
