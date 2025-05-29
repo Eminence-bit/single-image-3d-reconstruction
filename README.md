@@ -1,4 +1,5 @@
 # Single-Image 3D Reconstruction
+Turn any photo into a detailed, textured 3D model — no LiDAR, no depth cameras, just AI
 
 A comprehensive pipeline for transforming 2D images into textured 3D models using AI-powered computer vision techniques.
 
